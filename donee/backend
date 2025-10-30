@@ -1,0 +1,223 @@
+/**
+ * Scheme Finder – Backend API (Node + Express)
+ * Single-file deployable server with:
+ *  - POST /api/schemes/search  → matches schemes by user profile
+ *  - GET  /health               → liveness probe
+ *  - Basic security: CORS, Helmet, Rate Limiting
+ *  - Validation with Zod-style lightweight checks (no external deps needed)
+ *  - Optional OpenAI enrichment if OPENAI_API_KEY is set
+ *
+ * Quick start:
+ *   1) npm init -y && npm i express cors helmet express-rate-limit openai dotenv
+ *   2) node server.js
+ *   3) Set FRONTEND to your origin (e.g., http://localhost:5173)
+ *   4) Frontend expects POST /api/schemes/search with JSON body
+ *
+ * Environment variables (.env):
+ *   PORT=8080
+ *   FRONTEND=http://localhost:5173
+ *   OPENAI_API_KEY=sk-...
+ */
+
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
+import { OpenAI } from 'openai';
+
+dotenv.config();
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(helmet({
+  crossOriginResourcePolicy: false,
+}));
+
+const FRONTEND = process.env.FRONTEND || '*';
+app.use(cors({ origin: FRONTEND === '*' ? true : FRONTEND }));
+
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
+app.use(limiter);
+
+const PORT = Number(process.env.PORT || 8080);
+
+// --- Optional OpenAI ---
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  try {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    console.log('OpenAI enrichment enabled.');
+  } catch (e) {
+    console.warn('OpenAI client init failed, continuing without enrichment.');
+  }
+}
+
+// --- Lightweight validator (instead of zod for single-file simplicity) ---
+function assertString(v, name, { min = 0, max = 200 } = {}) {
+  if (typeof v !== 'string') throw new Error(`${name} must be a string`);
+  if (v.length < min || v.length > max) throw new Error(`${name} length invalid`);
+}
+function assertNumber(v, name, { min = 0, max = 150 } = {}) {
+  if (typeof v !== 'number' || Number.isNaN(v)) throw new Error(`${name} must be a number`);
+  if (v < min || v > max) throw new Error(`${name} out of range`);
+}
+function sanitize(str) {
+  return String(str || '').replace(/[<>]/g, '').trim();
+}
+
+// --- Minimal reference catalog (replace with DB later) ---
+const CATALOG = [
+  {
+    id: 'pm-mudra',
+    scheme_name: 'PM MUDRA (Shishu/Kishor/Tarun)',
+    category: 'business',
+    state: 'All India',
+    audience: 'Micro & small businesses',
+    benefits: 'Collateral-free loans up to ₹10 lakh via member banks/NBFCs.',
+    eligibility: 'Indian citizen with a non-farm micro enterprise; basic KYC; viable business use.',
+    documents: 'Aadhaar, PAN, application form, quotations, bank statements',
+    apply_link: 'https://www.mudra.org.in/',
+    source: 'Ministry of Finance'
+  },
+  {
+    id: 'maha-udyogini-yojana',
+    scheme_name: 'Maharashtra Udyogini Yojana',
+    category: 'business',
+    state: 'Maharashtra',
+    audience: 'Women entrepreneurs (18–55 years)',
+    benefits: 'Subsidised loans up to ₹3 lakh for micro businesses with interest concessions.',
+    eligibility: 'Resident of Maharashtra; woman applicant; income threshold as per bank norms; viable plan.',
+    documents: 'Aadhaar, PAN, residence proof, business plan, bank passbook, photos',
+    apply_link: 'https://mahajobs.gov.in/',
+    source: 'State portal / Banks'
+  },
+  {
+    id: 'nsfdc-women-textile',
+    scheme_name: 'NSFDC – Credit Support for Women (Textiles)',
+    category: 'business',
+    state: 'All India',
+    audience: 'Women from eligible categories starting textile units',
+    benefits: 'Interest subvention + working capital support via channel partners.',
+    eligibility: 'As per NSFDC norms; category certificate; bankable project.',
+    documents: 'KYC, project report, quotations, category certificate',
+    apply_link: 'https://nsfdc.nic.in/',
+    source: 'NSFDC'
+  },
+];
+
+// --- Helper: scoring + filtering ---
+function scoreScheme(scheme, profile) {
+  let score = 0;
+  const stateMatch = scheme.state === 'All India' || scheme.state === profile.state;
+  if (!stateMatch) return -1;
+
+  if (scheme.category === profile.category) score += 3;
+  if (/women|woman|female/i.test(scheme.audience || '') && profile.gender.toLowerCase() === 'female') score += 2;
+  if (/entrepreneur|business|micro|startup|msme/i.test((scheme.audience + ' ' + scheme.benefits))) score += 1;
+
+  // occupation/goal keyword match
+  const hay = (scheme.scheme_name + ' ' + scheme.benefits + ' ' + scheme.eligibility).toLowerCase();
+  const needles = profile.occupation.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  for (const n of needles) if (hay.includes(n)) score += 0.3;
+
+  return score;
+}
+
+function topMatches(profile, limit = 8) {
+  const ranked = CATALOG
+    .map((s) => ({ s, score: scoreScheme(s, profile) }))
+    .filter((x) => x.score >= 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.s);
+  return ranked;
+}
+
+// --- Optional: enrich with OpenAI (benefits/eligibility wording + steps) ---
+async function enrichWithAI(profile, schemes) {
+  if (!openai) return schemes;
+  try {
+    const sys = 'You are an assistant that writes concise, accurate, plain-language summaries of Indian government schemes. Always include: Benefits, Eligibility, Documents, and Application Steps. If exact details are unknown, say "Check official portal for latest" rather than guessing.';
+    const user = `Profile: ${JSON.stringify(profile)}\n\nSchemes:\n${schemes.map((s, i) => `${i + 1}. ${s.scheme_name} — ${s.benefits}\nEligibility: ${s.eligibility}\nDocuments: ${s.documents}\nLink: ${s.apply_link}`).join('\n\n')}`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-5-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: user }
+      ]
+    });
+
+    const text = completion.choices?.[0]?.message?.content || '';
+    // Very lightweight parse: we won't overwrite fields, just append a "ai_summary" field per scheme order.
+    const chunks = text.split(/\n(?=\d+\.)/).filter(Boolean);
+    return schemes.map((s, i) => ({ ...s, ai_summary: chunks[i] || undefined }));
+  } catch (e) {
+    console.warn('AI enrichment failed:', e.message);
+    return schemes;
+  }
+}
+
+// --- Routes ---
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+app.post('/api/schemes/search', async (req, res) => {
+  try {
+    const { age, gender, state, occupation = '', category = 'business', language = 'en' } = req.body || {};
+
+    assertNumber(age, 'age', { min: 1, max: 120 });
+    assertString(gender, 'gender', { min: 1, max: 40 });
+    assertString(state, 'state', { min: 2, max: 60 });
+    assertString(category, 'category', { min: 2, max: 40 });
+
+    const profile = {
+      age: Number(age),
+      gender: sanitize(gender),
+      state: sanitize(state),
+      occupation: sanitize(occupation).slice(0, 200),
+      category: sanitize(category),
+      language: language === 'hi' ? 'hi' : 'en',
+    };
+
+    let matches = topMatches(profile, 10);
+    matches = await enrichWithAI(profile, matches);
+
+    // Optional: translate to Hindi (very light-touch) using OpenAI if language = 'hi'
+    if (profile.language === 'hi' && openai) {
+      const translationPrompt = `Translate the following scheme fields to Hindi while keeping proper nouns in English when appropriate. Return JSON array with same keys.\n\n${JSON.stringify(matches)}`;
+      try {
+        const t = await openai.chat.completions.create({
+          model: 'gpt-5-mini',
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: 'Translate to natural, clear Hindi. Keep URLs unchanged.' },
+            { role: 'user', content: translationPrompt }
+          ]
+        });
+        const txt = t.choices?.[0]?.message?.content || '';
+        const jsonStart = txt.indexOf('[');
+        const jsonEnd = txt.lastIndexOf(']');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+          const arr = JSON.parse(txt.slice(jsonStart, jsonEnd + 1));
+          matches = Array.isArray(arr) ? arr : matches;
+        }
+      } catch (e) {
+        console.warn('Hindi translation failed, falling back to English.');
+      }
+    }
+
+    res.json({ schemes: matches });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message || 'Invalid request' });
+  }
+});
+
+// --- Start server ---
+app.listen(PORT, () => {
+  console.log(`Scheme Finder API running on http://localhost:${PORT}`);
+});
